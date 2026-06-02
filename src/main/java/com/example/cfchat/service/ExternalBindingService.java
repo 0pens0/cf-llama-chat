@@ -49,9 +49,10 @@ public class ExternalBindingService {
     @Getter
     private final Map<String, ExternalModelMetadata> embeddingModelMetadata = new ConcurrentHashMap<>();
 
-    public ExternalBindingService(ExternalBindingRepository repository) {
+    public ExternalBindingService(ExternalBindingRepository repository,
+                                  RestClient.Builder restClientBuilder) {
         this.repository = repository;
-        this.restClientBuilder = RestClient.builder();
+        this.restClientBuilder = restClientBuilder;
     }
 
     @PostConstruct

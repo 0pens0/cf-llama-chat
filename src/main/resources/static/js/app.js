@@ -347,7 +347,13 @@ class ChatApp {
 
         // Get selected model
         const modelValue = this.modelSelect.value;
-        const [provider, model] = modelValue ? modelValue.split(':') : ['openai', 'gpt-4o-mini'];
+        let provider = 'openai';
+        let model = 'gpt-4o-mini';
+        if (modelValue) {
+            const separator = modelValue.indexOf(':');
+            provider = modelValue.slice(0, separator);
+            model = modelValue.slice(separator + 1);
+        }
 
         // Add user message to UI
         this.addMessage('user', message);

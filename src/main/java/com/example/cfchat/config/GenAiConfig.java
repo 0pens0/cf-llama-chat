@@ -18,7 +18,11 @@ import org.springframework.context.annotation.Configuration;
 import org.springframework.context.annotation.Primary;
 import org.springframework.context.annotation.Profile;
 import org.springframework.web.client.RestClient;
+import org.springframework.web.reactive.function.client.WebClient;
+import org.springframework.http.client.JdkClientHttpRequestFactory;
+import org.springframework.http.client.reactive.JdkClientHttpConnector;
 
+import java.net.http.HttpClient;
 import java.util.*;
 
 /**
@@ -43,8 +47,8 @@ public class GenAiConfig {
 
     private final RestClient.Builder restClientBuilder;
 
-    public GenAiConfig() {
-        this.restClientBuilder = RestClient.builder();
+    public GenAiConfig(RestClient.Builder restClientBuilder) {
+        this.restClientBuilder = restClientBuilder;
         log.info("GenAiConfig initializing - parsing VCAP_SERVICES for GenAI services");
         initializeModelsFromVcap();
     }
@@ -52,7 +56,10 @@ public class GenAiConfig {
     private void initializeModelsFromVcap() {
         try {
             CfEnv cfEnv = new CfEnv();
-            List<CfService> genaiServices = cfEnv.findServicesByLabel("genai");
+            List<CfService> genaiServices = cfEnv.findServicesByTag("genai");
+            if (genaiServices.isEmpty()) {
+                genaiServices = cfEnv.findServicesByLabel("genai", "ai-models");
+            }
 
             log.info("Found {} GenAI service(s) in VCAP_SERVICES", genaiServices.size());
 
@@ -104,14 +111,36 @@ public class GenAiConfig {
         Map<String, Object> endpoint = (Map<String, Object>) credentials.get("endpoint");
 
         String configUrl = (String) endpoint.get("config_url");
-        String apiKey = (String) endpoint.get("api_key");
+        String apiKey = firstNonBlank(
+                (String) endpoint.get("api_key"),
+                (String) endpoint.get("credential"),
+                (String) credentials.get("api_key"),
+                (String) credentials.get("credential")
+        );
         String apiBase = (String) endpoint.get("api_base");
 
         log.info("Initializing GenAI Locator service: {} (config_url: {})", serviceName, configUrl);
+        // region agent log
+        log.info("Debug vPAIS credential presence for {}: endpointKeys={}, hasApiKey={}, hasCredential={}",
+                serviceName,
+                endpoint.keySet(),
+                endpoint.get("api_key") != null || credentials.get("api_key") != null,
+                endpoint.get("credential") != null || credentials.get("credential") != null);
+        // endregion
 
         if (configUrl == null || apiKey == null) {
             log.warn("GenAI Locator service {} missing required endpoint credentials", serviceName);
             return;
+        }
+
+        // vPAIS/vLLM OpenAI-compatible baseUrl expects `/openai` prefix.
+        // Without it, Spring AI calls `${baseUrl}/v1/chat/completions` which the proxy treats as 404.
+        if (isVpaisService(service) && apiBase != null) {
+            String trimmed = apiBase.replaceAll("/+$", "");
+            if (!trimmed.endsWith("/openai")) {
+                apiBase = trimmed + "/openai";
+                log.info("Adjusted vPAIS api_base for {}: {}", serviceName, apiBase);
+            }
         }
 
         try {
@@ -133,13 +162,15 @@ public class GenAiConfig {
                     }
 
                     try {
-                        // Get the ChatModel from the locator for this specific model
+                        // Keep using locator-provided model wiring so provider-specific auth headers are preserved.
+                        // HTTP/1.1 is enforced globally by CloudGenAiHttpConfig beans.
                         ChatModel chatModel = locator.getChatModelByName(modelName);
                         if (chatModel != null) {
                             chatModels.put(modelName, chatModel);
                             modelMetadata.put(modelName, new ModelMetadata(
                                     modelName,
                                     serviceName,
+                                    service.getPlan(),
                                     "GenaiLocator"
                             ));
                             log.info("Registered ChatModel from GenAI Locator: {} (service: {})", modelName, serviceName);
@@ -219,6 +250,7 @@ public class GenAiConfig {
             modelMetadata.put(modelName, new ModelMetadata(
                     modelName,
                     serviceName,
+                    service.getPlan(),
                     "OpenAiChatModel"
             ));
 
@@ -314,6 +346,48 @@ public class GenAiConfig {
         return Collections.unmodifiableList(genaiLocators);
     }
 
+    private static boolean isVpaisService(CfService service) {
+        String plan = service.getPlan();
+        if (plan != null && (plan.regionMatches(true, 0, "vPAIS", 0, 5)
+                || plan.regionMatches(true, 0, "vPAIF", 0, 5))) {
+            return true;
+        }
+        String serviceName = service.getName();
+        return serviceName != null && (serviceName.toLowerCase().contains("gpt-oss")
+                || serviceName.toLowerCase().contains("qwen-coder"));
+    }
+
+    /**
+     * Build a chat model for vPAIS/vLLM backends using HTTP/1.1 (required for streaming).
+     */
+    private ChatModel buildHttp11OpenAiChatModel(String modelName, String apiBase, String apiKey) {
+        if (apiBase == null || apiKey == null) {
+            log.warn("Cannot build vPAIS ChatModel for {} - missing api_base or api_key", modelName);
+            return null;
+        }
+        HttpClient httpClient = CloudGenAiHttpConfig.httpClient();
+        RestClient.Builder restBuilder = RestClient.builder()
+                .requestFactory(new JdkClientHttpRequestFactory(httpClient));
+        WebClient.Builder webBuilder = WebClient.builder()
+                .clientConnector(new JdkClientHttpConnector(httpClient));
+
+        OpenAiApi openAiApi = OpenAiApi.builder()
+                .baseUrl(apiBase)
+                .apiKey(apiKey)
+                .restClientBuilder(restBuilder)
+                .webClientBuilder(webBuilder)
+                .build();
+
+        OpenAiChatOptions options = OpenAiChatOptions.builder()
+                .model(modelName)
+                .build();
+
+        return OpenAiChatModel.builder()
+                .openAiApi(openAiApi)
+                .defaultOptions(options)
+                .build();
+    }
+
     /**
      * Checks if a model name indicates an embedding model (not suitable for chat).
      */
@@ -329,12 +403,76 @@ public class GenAiConfig {
                lowerName.contains("ada-002");
     }
 
+    private static String firstNonBlank(String... values) {
+        for (String value : values) {
+            if (value != null && !value.isBlank()) {
+                return value;
+            }
+        }
+        return null;
+    }
+
+    /**
+     * Returns UI display name for a model (e.g. vPAIS plans show branded labels).
+     */
+    public String getDisplayName(String modelId) {
+        ModelMetadata meta = modelMetadata.get(modelId);
+        if (meta == null) {
+            return modelId;
+        }
+        if (isVpaisModel(modelId)) {
+            if (meta.servicePlan() != null && !meta.servicePlan().isBlank()) {
+                return formatVpaisPlanName(meta.servicePlan());
+            }
+            return "vPAIS " + modelId;
+        }
+        return modelId;
+    }
+
+    /**
+     * Provider label for UI grouping ({@code vpais} vs {@code genai}).
+     */
+    public String getUiProvider(String modelId) {
+        return isVpaisModel(modelId) ? "vpais" : "genai";
+    }
+
+    public boolean isVpaisModel(String modelId) {
+        ModelMetadata meta = modelMetadata.get(modelId);
+        if (meta == null) {
+            return false;
+        }
+        String plan = meta.servicePlan();
+        if (plan != null && plan.regionMatches(true, 0, "vPAIS", 0, 5)) {
+            return true;
+        }
+        if (plan != null && plan.regionMatches(true, 0, "vPAIF", 0, 5)) {
+            return true;
+        }
+        String serviceName = meta.serviceName();
+        if (serviceName == null) {
+            return false;
+        }
+        String lower = serviceName.toLowerCase();
+        return lower.contains("gpt-oss") || lower.contains("qwen-coder");
+    }
+
+    private static String formatVpaisPlanName(String plan) {
+        if (plan.regionMatches(true, 0, "vPAIS-", 0, 6)) {
+            return "vPAIS " + plan.substring(6).replace('-', ' ');
+        }
+        if (plan.regionMatches(true, 0, "vPAIF-", 0, 6)) {
+            return "vPAIF " + plan.substring(6).replace('-', ' ');
+        }
+        return plan;
+    }
+
     /**
      * Metadata about a configured model.
      */
     public record ModelMetadata(
             String modelName,
             String serviceName,
+            String servicePlan,
             String modelType
     ) {}
 }

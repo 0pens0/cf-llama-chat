@@ -113,6 +113,14 @@
                                         th:title="${model.description}">
                                 </option>
                             </optgroup>
+                            <optgroup th:if="${#lists.size(models.?[provider == 'vpais']) > 0}" label="vPAIS">
+                                <option th:each="model : ${models}"
+                                        th:if="${model.provider == 'vpais'}"
+                                        th:value="${model.provider + ':' + model.id}"
+                                        th:text="${model.name}"
+                                        th:title="${model.description}">
+                                </option>
+                            </optgroup>
                             <optgroup th:if="${#lists.size(models.?[provider == 'genai']) > 0}" label="genai">
                                 <option th:each="model : ${models}"
                                         th:if="${model.provider == 'genai'}"

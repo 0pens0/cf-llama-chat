@@ -10,6 +10,7 @@ import com.example.cfchat.model.Message;
 import com.example.cfchat.model.ModelInfo;
 import com.example.cfchat.model.Skill;
 import com.example.cfchat.model.User;
+import com.fasterxml.jackson.databind.ObjectMapper;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.ai.chat.client.ChatClient;
 import org.springframework.ai.chat.messages.AssistantMessage;
@@ -30,8 +31,13 @@ import reactor.core.publisher.Flux;
 import com.example.cfchat.config.GenAiConfig;
 import com.example.cfchat.service.ExternalBindingService;
 
+import java.nio.file.Files;
+import java.nio.file.Path;
+import java.nio.file.StandardOpenOption;
 import java.util.ArrayList;
+import java.util.LinkedHashMap;
 import java.util.List;
+import java.util.Map;
 import java.util.UUID;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
@@ -40,6 +46,8 @@ import java.util.concurrent.atomic.AtomicLong;
 @Service
 @Slf4j
 public class ChatService {
+    private static final Path DEBUG_LOG_PATH = Path.of("/Users/orenpenso/git/cf-llama-chat/.cursor/debug-9421df.log");
+    private static final ObjectMapper DEBUG_MAPPER = new ObjectMapper();
 
     private final ChatClient primaryChatClient;
     private final ChatModel primaryChatModel;
@@ -256,6 +264,48 @@ public class ChatService {
         if (!request.isUseTools()) {
             log.debug("MCP tools disabled by user preference for streaming request");
         }
+        // region agent log
+        appendDebugNdjson("H3", "chatStream branch inputs", Map.of(
+                "provider", provider,
+                "model", model != null ? model : "",
+                "isVpaisProvider", isVpaisProvider(provider),
+                "toolProvidersCount", toolProviders.length
+        ));
+        // endregion
+
+        // vPAIS/vLLM often returns 400 on SSE; emulate streaming with one non-stream chunk.
+        if (isVpaisProvider(provider) && toolProviders.length == 0) {
+            ChatModel vpaisModel = getStreamingModel(provider, model);
+            if (vpaisModel == null) {
+                return Flux.error(new IllegalStateException("No chat model available for provider: " + provider));
+            }
+            log.info("vPAIS stream fallback (non-SSE) for model: {}", model);
+            responseFlux = Flux.defer(() -> {
+                var result = vpaisModel.call(prompt);
+                String content = result.getResult() != null ? result.getResult().getOutput().getText() : "";
+                // region agent log
+                appendDebugNdjson("H4", "vPAIS fallback call completed", Map.of(
+                        "model", model != null ? model : "",
+                        "contentLength", content != null ? content.length() : 0
+                ));
+                // endregion
+                if (content != null && !content.isEmpty()) {
+                    firstTokenTime.set(System.currentTimeMillis());
+                    firstTokenReceived.set(true);
+                    fullResponse.append(content);
+                    tokenCount.incrementAndGet();
+                }
+                return Flux.just(ChatResponse.builder()
+                        .conversationId(finalConversationId)
+                        .content(content != null ? content : "")
+                        .streaming(true)
+                        .complete(false)
+                        .build());
+            });
+            return responseFlux.concatWith(buildStreamCompletionFlux(
+                    finalConversationId, finalUserId, finalProvider, model, userMessage,
+                    fullResponse, startTime, firstTokenTime, tokenCount));
+        }
 
         // If we have tools and user enabled them, use ChatClient for streaming (supports tool callbacks)
         // Otherwise, use ChatModel directly for better compatibility
@@ -320,45 +370,55 @@ public class ChatService {
                     });
         }
 
-        return responseFlux.concatWith(Flux.defer(() -> {
-            // Save complete response
+        return responseFlux.concatWith(buildStreamCompletionFlux(
+                finalConversationId, finalUserId, finalProvider, model, userMessage,
+                fullResponse, startTime, firstTokenTime, tokenCount));
+    }
+
+    private Flux<ChatResponse> buildStreamCompletionFlux(
+            UUID conversationId,
+            UUID userId,
+            String provider,
+            String model,
+            String userMessage,
+            StringBuilder fullResponse,
+            AtomicLong startTime,
+            AtomicLong firstTokenTime,
+            AtomicInteger tokenCount) {
+        return Flux.defer(() -> {
             String completeResponse = fullResponse.toString();
             Message savedMessage = conversationService.addMessage(
-                    finalConversationId,
+                    conversationId,
                     Message.MessageRole.ASSISTANT,
                     completeResponse,
                     model
             );
 
-            // Calculate metrics
             long endTime = System.currentTimeMillis();
             long responseTime = endTime - startTime.get();
             int promptTokens = estimateTokens(userMessage);
             int completionTokens = estimateTokens(completeResponse);
 
-            // Time to first token
             Long timeToFirstToken = firstTokenTime.get() > 0 ?
                     firstTokenTime.get() - startTime.get() : responseTime;
 
-            // Tokens per second (using estimated completion tokens)
             Double tokensPerSecond = responseTime > 0 ?
                     (completionTokens / (responseTime / 1000.0)) : 0.0;
 
             log.info("Streaming metrics - TTFT: {}ms, TPS: {}, Total: {}ms, Model: {}",
                     timeToFirstToken, String.format("%.1f", tokensPerSecond), responseTime, model);
 
-            metricsService.recordUsage(finalUserId, finalConversationId, model, finalProvider,
+            metricsService.recordUsage(userId, conversationId, model, provider,
                     promptTokens, completionTokens, responseTime, timeToFirstToken, tokensPerSecond);
 
-            // Update conversation title if first exchange
-            Conversation conv = conversationService.getConversationEntity(finalConversationId).orElse(null);
+            Conversation conv = conversationService.getConversationEntity(conversationId).orElse(null);
             if (conv != null && conv.getMessages().size() <= 2) {
                 String title = generateTitle(userMessage);
-                conversationService.updateConversationTitle(finalConversationId, title);
+                conversationService.updateConversationTitle(conversationId, title);
             }
 
             ChatResponse finalResponse = ChatResponse.builder()
-                    .conversationId(finalConversationId)
+                    .conversationId(conversationId)
                     .messageId(savedMessage.getId())
                     .content("")
                     .htmlContent(markdownService.toHtml(completeResponse))
@@ -370,13 +430,31 @@ public class ChatService {
                     .totalResponseTimeMs(responseTime)
                     .build();
 
-            log.info("Sending final response with metrics - TTFT: {}, TPS: {}, Total: {}",
-                    finalResponse.getTimeToFirstTokenMs(),
-                    finalResponse.getTokensPerSecond(),
-                    finalResponse.getTotalResponseTimeMs());
-
             return Flux.just(finalResponse);
-        }));
+        });
+    }
+
+    private static boolean isVpaisProvider(String provider) {
+        return provider != null && ("vpais".equalsIgnoreCase(provider) || "vpaif".equalsIgnoreCase(provider));
+    }
+
+    private static void appendDebugNdjson(String hypothesisId, String message, Map<String, Object> data) {
+        try {
+            Map<String, Object> payload = new LinkedHashMap<>();
+            payload.put("sessionId", "9421df");
+            payload.put("runId", "pre-fix-1");
+            payload.put("hypothesisId", hypothesisId);
+            payload.put("location", "ChatService:chatStream");
+            payload.put("message", message);
+            payload.put("data", data);
+            payload.put("timestamp", System.currentTimeMillis());
+            Files.writeString(
+                    DEBUG_LOG_PATH,
+                    DEBUG_MAPPER.writeValueAsString(payload) + System.lineSeparator(),
+                    StandardOpenOption.CREATE, StandardOpenOption.APPEND
+            );
+        } catch (Exception ignored) {
+        }
     }
 
     public List<ModelInfo> getAvailableModels() {
@@ -385,9 +463,9 @@ public class ChatService {
         // Check if running in cloud profile with GenAI
         boolean isCloudProfile = activeProfile != null && activeProfile.contains("cloud");
 
-        if (isCloudProfile && primaryChatClient != null) {
+        if (isCloudProfile && genAiConfig != null && genAiConfig.hasGenAiModels()) {
             // Running on Tanzu with GenAI service - get actual model names
-            List<String> genAiModelNames = genAiConfig != null ? genAiConfig.getAvailableModelNames() : List.of();
+            List<String> genAiModelNames = genAiConfig.getAvailableModelNames();
 
             if (!genAiModelNames.isEmpty()) {
                 for (String modelName : genAiModelNames) {
@@ -395,11 +473,16 @@ public class ChatService {
                     if (modelName.toLowerCase().contains("embed")) {
                         continue;
                     }
+                    String provider = genAiConfig.getUiProvider(modelName);
+                    String displayName = genAiConfig.getDisplayName(modelName);
+                    String description = "vpais".equals(provider)
+                            ? "VMware Private AI Services: " + displayName
+                            : "Tanzu GenAI: " + modelName;
                     models.add(ModelInfo.builder()
                             .id(modelName)
-                            .name(modelName)
-                            .provider("genai")
-                            .description("Tanzu GenAI: " + modelName)
+                            .name(displayName)
+                            .provider(provider)
+                            .description(description)
                             .available(true)
                             .build());
                 }
@@ -507,8 +590,8 @@ public class ChatService {
             }
         }
 
-        // For GenAI, try to get the specific model if provided
-        if ("genai".equalsIgnoreCase(provider) && modelName != null && genAiConfig != null) {
+        // For GenAI / vPAIS, try to get the specific model if provided
+        if (isGenAiProvider(provider) && modelName != null && genAiConfig != null) {
             ChatClient modelClient = genAiConfig.getChatClientForModel(modelName);
             if (modelClient != null) {
                 log.debug("Using GenAI model: {}", modelName);
@@ -536,8 +619,8 @@ public class ChatService {
             }
         }
 
-        // For GenAI, try to get the specific model if provided
-        if ("genai".equalsIgnoreCase(provider) && modelName != null && genAiConfig != null) {
+        // For GenAI / vPAIS, try to get the specific model if provided
+        if (isGenAiProvider(provider) && modelName != null && genAiConfig != null) {
             ChatModel model = genAiConfig.getChatModelByName(modelName);
             if (model != null) {
                 log.debug("Using GenAI streaming model: {}", modelName);
@@ -547,6 +630,15 @@ public class ChatService {
 
         // Use primary model for openai, genai (default), or any other provider
         return primaryChatModel;
+    }
+
+    private static boolean isGenAiProvider(String provider) {
+        if (provider == null) {
+            return false;
+        }
+        return "genai".equalsIgnoreCase(provider)
+                || "vpais".equalsIgnoreCase(provider)
+                || "vpaif".equalsIgnoreCase(provider);
     }
 
     private List<org.springframework.ai.chat.messages.Message> buildMessageHistory(

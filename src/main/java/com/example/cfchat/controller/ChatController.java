@@ -26,7 +26,6 @@ import java.util.*;
 @RequiredArgsConstructor
 @Slf4j
 public class ChatController {
-
     private final ChatService chatService;
     private final UserService userService;
     private final ToolService toolService;

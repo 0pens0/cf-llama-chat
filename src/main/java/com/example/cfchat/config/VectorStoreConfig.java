@@ -196,7 +196,10 @@ public class VectorStoreConfig {
     private EmbeddingModel tryDirectBindingEmbedding() {
         try {
             CfEnv cfEnv = new CfEnv();
-            List<CfService> genaiServices = cfEnv.findServicesByLabel("genai");
+            List<CfService> genaiServices = cfEnv.findServicesByTag("genai");
+            if (genaiServices.isEmpty()) {
+                genaiServices = cfEnv.findServicesByLabel("genai", "ai-models");
+            }
 
             log.info("Found {} GenAI service(s) in VCAP_SERVICES for embedding", genaiServices.size());
 
